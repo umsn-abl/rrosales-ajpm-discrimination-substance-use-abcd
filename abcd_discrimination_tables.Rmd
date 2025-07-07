@@ -1,0 +1,497 @@
+---
+title: "ABCD Discrimination and Substance Use Analysis"
+author: "John Jardine"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    toc: TRUE
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 100% !important;
+  margin: auto;
+}
+</style>
+
+# Code
+
+## Packages
+
+```{r packages, echo = TRUE, message = FALSE}
+if(!("pacman" %in% rownames(installed.packages()))) {install.packages("pacman")}
+pacman::p_load(dplyr, purrr, tidyr, haven, survey, geepack, knitr, kableExtra)
+
+options(knitr.kable.NA = "")
+
+# function to relabel variables so the order of the new levels is the same as how it is specified in the case_when statement
+fct_case_when = function(...) {
+  args <- as.list(match.call())
+  levels <- sapply(args[-1], function(f) f[[3]])
+  levels <- levels[!is.na(levels)]
+  factor(dplyr::case_when(...), levels=levels)
+}
+
+# function to take the output returned by svyby() (with svyciprop()) and combine the point estimate and confidence interval into a single column
+pe_ci = function(mat) {
+  outcome = names(mat)[2]
+  mat %>%
+    mutate(!!sym(outcome) := paste0(sprintf("%.2f", !!sym(outcome) * 100), " (", sprintf("%.2f", ci_l * 100), ", ", sprintf("%.2f", ci_u * 100), ")")) %>%
+    select(-c(ci_l, ci_u))
+}
+```
+
+## Data Formatting
+
+```{r data_format, echo = TRUE, message = FALSE, results = "asis"}
+# local path where the ABCD discrimination dataset is located
+path = "C:/Users/jjardine/Desktop/ABCD/data/discrimination/"
+
+# load in the ABCD discrimination dataset
+load(paste0(path, "abcd_discrimination_data.RDa"))
+
+# select just the variables of interest
+dat = abcd_discrimination_data %>%
+  select(src_subject_id, matches("longDummy"), matches("site_id_l"), matches("rel_family_id"), interview_age_0, sex_at_birth_0, race_ethnicity_0, demo_prnt_marital_v2_0,
+         demo_prnt_prtnr_ed_agg_0, demo_prnt_prtnr_empl_0, demo_comb_income_agg_0, matches("dim_y_ss_mean"), matches("heard"), matches("bool_b"), matches("any_curious"), matches("try_soon"))
+
+# reshape the data into long format
+dat = dat %>%
+  pivot_longer(cols = -c(src_subject_id),
+               names_to = c(".value", "event"),
+               names_pattern = "(.*)_(.*)") %>%
+  mutate(event = as.numeric(event))
+
+# for the discrimination measure, take the maximum score across all time points, and change the scale from 1-5 to 0-4.
+# also, make a copy of the variable so that it can be left as time-varying for a supplemental analysis.
+dat = dat %>%
+  group_by(src_subject_id) %>%
+  mutate(dim_y_ss_mean_tv = dim_y_ss_mean - 1,
+         dim_y_ss_mean = ifelse(sum(!is.na(dim_y_ss_mean)) > 0, max(dim_y_ss_mean - 1, na.rm = TRUE), NA)) %>%
+  ungroup()
+
+# for all other covariates, propagate the value at baseline through to all events
+dat = dat %>%
+  group_by(src_subject_id) %>%
+  mutate(across(c(rel_family_id, interview_age, sex_at_birth, race_ethnicity, demo_prnt_marital_v2, demo_prnt_prtnr_ed_agg, demo_prnt_prtnr_empl, demo_comb_income_agg), ~ .x[event == 0])) %>%
+  ungroup()
+
+# dichotomize the age variables as 0 = 9 or younger, 1 = 10 or older
+dat = dat %>%
+  mutate(interview_age = fct_case_when(interview_age < 10 ~ 0,
+                                       interview_age >= 10 ~ 1))
+
+# filter the data to just the full-year events (with the qualifier the respondent was actually present at the given event)
+dat = dat %>% filter(event %in% c(0, 12, 24, 36, 48) & longDummy == 1) %>% select(-longDummy)
+
+# convert the event variable to the year number
+dat = dat %>% mutate(event = event / 12)
+
+# convert the site IDs to integers
+dat = dat %>% mutate(site_id_l = as.numeric(gsub("\\D", "", site_id_l)))
+```
+
+## Variable Recoding
+
+```{r var_recode, echo = TRUE, message = FALSE, results = "asis"}
+# recode the covariates for displaying in tables
+dat = dat %>%
+  mutate(
+    
+    interview_age = fct_case_when(interview_age == 0 ~ "9 or younger",
+                                  interview_age == 1 ~ "10 or older"),
+    
+    sex_at_birth = fct_case_when(sex_at_birth == 0 ~ "Male",
+                                 sex_at_birth == 1 ~ "Female"),
+    
+    race_ethnicity = fct_case_when(race_ethnicity == 1 ~ "Non-Hispanic White only",
+                                   race_ethnicity == 2 ~ "Non-Hispanic Black only",
+                                   race_ethnicity == 3 ~ "Hispanic",
+                                   race_ethnicity == 4 ~ "Non-Hispanic Asian only",
+                                   race_ethnicity == 5 ~ "Non-Hispanic other race or multiracial"),
+    
+    demo_prnt_prtnr_ed_agg   = fct_case_when(demo_prnt_prtnr_ed_agg == 0 ~ "Less than high school",
+                                             demo_prnt_prtnr_ed_agg == 1 ~ "High school",
+                                             demo_prnt_prtnr_ed_agg == 2 ~ "Some college",
+                                             demo_prnt_prtnr_ed_agg == 3 ~ "Associate's degree",
+                                             demo_prnt_prtnr_ed_agg == 4 ~ "Bachelor's degree or higher"),
+    
+    demo_prnt_marital_v2 = fct_case_when(demo_prnt_marital_v2 == 0 ~ "Not married",
+                                         demo_prnt_marital_v2 == 1 ~ "Married"),
+    
+    demo_prnt_prtnr_empl = fct_case_when(demo_prnt_prtnr_empl == 0 ~ "Neither parent or partner works full-time",
+                                         demo_prnt_prtnr_empl == 1 ~ "At least one of parent or partner works full-time"),
+    
+    demo_comb_income_agg   = fct_case_when(demo_comb_income_agg == 0 ~ "$24,999 or lower",
+                                           demo_comb_income_agg == 1 ~ "$25,000 to 49,999",
+                                           demo_comb_income_agg == 2 ~ "$50,000 to 74,999",
+                                           demo_comb_income_agg == 3 ~ "$75,000 to 99,999",
+                                           demo_comb_income_agg == 4 ~ "$100,000 or greater",
+                                           demo_comb_income_agg == 5 ~ "Don't know",
+                                           demo_comb_income_agg == 6 ~ "Refuse to answer"))
+
+# create a categorical version of the discrimination measure. do this for both the time-invariant and time-varying versions of the measure
+dat = dat %>%
+  mutate(dim_y_ss_mean_c = fct_case_when(dim_y_ss_mean == 0 ~ "x = 0",
+                                         dim_y_ss_mean <= 0.5 ~ "0 < x <= 0.5",
+                                         dim_y_ss_mean > 0.5 ~ "x > 0.5"),
+         
+         dim_y_ss_mean_tv_c = fct_case_when(dim_y_ss_mean_tv == 0 ~ "x = 0",
+                                            dim_y_ss_mean_tv <= 0.5 ~ "0 < x <= 0.5",
+                                            dim_y_ss_mean_tv > 0.5 ~ "x > 0.5"))
+```
+
+# Tables
+
+## Table 1
+
+```{r table_1, echo = FALSE, message = FALSE, results = "asis"}
+# function to return the unweighted sample sizes and percentages for a given variable
+uw_sizes_percent = function(.x) {
+  
+  # get the unweighted sample sizes
+  uw_sizes = dat %>% filter(event == 0) %>% count(!!sym(.x))
+  
+  # get the unweighted percents
+  uw_percent = dat %>%
+    filter(event == 0) %>%
+    count(!!sym(.x)) %>%
+    mutate(p = ifelse(is.na(!!sym(.x)), sprintf("%.2f", n / sum(n) * 100),
+                      sprintf("%.2f", n / sum(n[!is.na(!!sym(.x))]) * 100))) %>%
+    select(-n)
+  
+  # join the sample sizes and percents together
+  mat = inner_join(uw_sizes, uw_percent, by = .x) %>%
+    rename(value = !!sym(.x)) %>%
+    select(value, n, p)
+  
+  # extract the missing sample size and percent
+  miss = mat %>%
+    filter(is.na(value)) %>%
+    summarize(miss = paste0(prettyNum(n, ","), " (", p, "%)")) %>%
+    mutate(miss = ifelse(miss == " (%)", "0 (0%)", miss))
+  
+  # return the sample sizes and percents
+  bind_cols(miss,
+            mat %>% filter(!is.na(value))) %>%
+    mutate(n_p = paste0(prettyNum(n, ","), " (", p, "%)"),
+           value = as.character(value)) %>%
+    select(value, n_p, miss) %>%
+    mutate(miss = ifelse(row_number() == 1, miss, NA),
+           variable = .x) %>%
+    relocate(variable)
+}
+
+map(c("interview_age", "sex_at_birth", "race_ethnicity", "demo_prnt_prtnr_ed_agg", "demo_prnt_marital_v2", "demo_prnt_prtnr_empl", "demo_comb_income_agg", "dim_y_ss_mean_c"),
+    uw_sizes_percent) %>%
+  bind_rows() %>%
+  mutate(variable = case_match(variable,
+                               "interview_age" ~ "Child's age at baseline",
+                               "sex_at_birth" ~ "Child's sex at birth",
+                               "race_ethnicity" ~ "Child's race / ethnicity",
+                               "demo_prnt_prtnr_ed_agg" ~ "Highest level of parental education",
+                               "demo_prnt_marital_v2" ~ "Parental marital status",
+                               "demo_prnt_prtnr_empl" ~ "Parental employment status",
+                               "demo_comb_income_agg" ~ "Total combined family income",
+                               "dim_y_ss_mean_c" ~ "Discrimination score")) %>%
+  group_by(variable) %>%
+  mutate(variable = ifelse(row_number() == 1, variable, NA)) %>%
+  kable(align = "llrr",
+        caption = paste0("Table 1: Sample Characteristics of Respondents in the ABCD Study (n = ", prettyNum(dat %>% distinct(src_subject_id) %>% nrow(), big.mark = ","), ")"),
+        col.names = c("", "", "n (%)", "Missing"),
+        digits = 2) %>%
+  kable_classic_2("striped") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(1:3, border_right = TRUE) %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(c(2, 4, 9, 14, 16, 18, 25), extra_css = "border-bottom: 1px solid") %>%
+  footnote(general = "All measures except the discrimination item were assessed at baseline. The discrimination item represents the respondent's highest score across the year 1, 2, and 4 follow-ups (assuming they had a non-missing value for at least one event). The discrimination item was re-scaled from 1-5 to 0-4.",
+           general_title = "")
+
+cat("<br><br><br><br><br>")
+```
+
+## Table 2
+
+```{r table_2, echo = FALSE, message = FALSE, warning = FALSE, results = "asis"}
+# create a vector storing all the outcome names
+outcomes = c("drink_bool_b", "tob_bool_b", "mj_bool_b", "alc_any_curious", "tob_any_curious", "mj_any_curious", "alc_try_soon", "tob_try_soon", "mj_try_soon")
+
+# create a version of the dataset where the substance use / intention variables are coded as the maximum value across all time points for a given respondent.
+# also, only include one record (baseline) from each respondent
+temp = dat %>%
+  group_by(src_subject_id) %>%
+  mutate(across(all_of(outcomes), ~  ifelse(sum(!is.na(.x)) > 0, max(.x, na.rm = TRUE), NA))) %>%
+  ungroup() %>%
+  filter(event == 0)
+
+# create the survey design object
+des = svydesign(ids = ~rel_family_id,
+                strata = ~site_id_l,
+                nest = TRUE,
+                data = temp)
+
+map(outcomes, function(x) {pe_ci(svyby(as.formula(paste0("~", x)), ~race_ethnicity, des, svyciprop, vartype = "ci", na.rm = TRUE))}) %>%
+  reduce(inner_join, by = "race_ethnicity") %>%
+  rename(var = race_ethnicity) %>%
+  kable(align = "lrrrrrrrrr",
+        caption = "Table 2: Prevalence of Substance Use and Intentions to Use by Race / Ethnicity: % (95% CI)",
+        col.names = c("", rep(c("Alcohol", "Tobacco", "Marijuana"), 3))) %>%
+  kable_classic_2("striped") %>%
+  column_spec(c(1, 4, 7), border_right = TRUE) %>%
+  pack_rows("Race / Ethnicity", 1, 5, background = "#ffffff") %>%
+  row_spec(0, bold = TRUE) %>%
+  add_header_above(c("", "Use" = 3, "Curiosity" = 3, "'Will Try Soon'" = 3), bold = TRUE) %>%
+  footnote(general = "For substance use (and intentions to use), respondents were coded as '1' if they indicated use at any event. Else, they were coded as '0' as long as they indicated no use at at least one event. For alcohol, 'use' is defined as having tried a full drink of beer, wine, or liquor. For tobacco, 'use' is defined as having tried a tobacco cigarette; an electronic cigarette, vape pen, or e-hookah; smokeless tobacco, chew, or snus; cigars, including traditional cigars, little cigars, or cigarillos; hookah; pipes; and nicotine replacements, such as patches, gums, nasal sprays, inhalers, and lozenges. A puff of a tobacco product counts as 'use'. For marijuana, 'use' is defined as having tried smoking marijuana; blunts; marijuana that you eat, such as pot cookies, gummy bears, or brownies; marijuana oils or concentrates; marijuana infused alcohol drinks; concentrated marijuana tinctures; vaping marijuana flower or bud; and vaping marijuana oils or concentrates. More detailed examples of certain methods are given in the ABCD codebooks. A puff of a marijuana product counts as 'use'.\n\nThe curiosity measure was dichotomized as 0 = 'not at all curious', 1 = 'a little curious' to 'very curious'. The 'will try soon' measure was dichotomized as 0 = 'probably not' to 'definitely not', 1 = 'probably yes' to 'definitely yes'. For a given event, only respondents who knew what the substance was, but hadn't tried it yet (including just a sip of alcohol or a puff of tobacco / marijuana), were asked about their curiosity and intention to use that substance.",
+           general_title = "")
+
+cat("<br><br><br><br><br>")
+```
+
+## Table 3
+
+```{r table_3, echo = FALSE, message = FALSE, results = "asis"}
+resultsGen = function(outcome, modType, dimVar) {
+  
+  covariates = c("interview_age", "sex_at_birth", "demo_prnt_marital_v2", "demo_prnt_prtnr_ed_agg", "demo_prnt_prtnr_empl", "demo_comb_income_agg")
+  
+  if(modType == "main")  {ff = as.formula(paste0(outcome, " ~ event + ", paste(paste0("as.factor(", covariates, ")"), collapse = " + "), " + as.factor(race_ethnicity) + ", dimVar)); bonf = 15}
+  if(modType == "int")   {ff = as.formula(paste0(outcome, " ~ event + ", paste(paste0("as.factor(", covariates, ")"), collapse = " + "), " + as.factor(race_ethnicity):", dimVar));   bonf = 15}
+  if(modType == "full")  {ff = as.formula(paste0(outcome, " ~ event + ", paste(paste0("as.factor(", covariates, ")"), collapse = " + "), " + as.factor(race_ethnicity)*", dimVar));   bonf = 27}
+  
+  myMod = geeglm(formula = ff,
+                 data = dat %>% mutate(src_subject_id = as.numeric(as.factor(src_subject_id))) %>% select(src_subject_id, event, all_of(c(outcome, covariates, dimVar)), race_ethnicity) %>% filter(complete.cases(.)),
+                 family = binomial(link = "logit"),
+                 id = src_subject_id,
+                 corstr = "exchangeable")
+  
+  data.frame(effect = names(coef(myMod)),
+             pe = exp(coef(myMod)),
+             lb = exp(confint.default(myMod, level = (1 - .05/bonf)))[, 1],
+             ub = exp(confint.default(myMod, level = (1 - .05/bonf)))[, 2]) %>%
+    mutate(pe_ci = paste0(sprintf("%.2f", pe), " (", sprintf("%.2f", lb), ", ", sprintf("%.2f", ub), ")")) %>%
+    select(-c(pe, lb, ub)) %>%
+    filter(grepl("race|dim", effect) ) %>%
+    `rownames<-`(NULL) %>%
+    add_row(effect = "obs.", pe_ci = paste0("obs. = ", prettyNum(nrow(myMod[["data"]]), ",")),         .before = 1) %>%
+    add_row(effect = "n", pe_ci = paste0("n = ",    prettyNum(length(unique(myMod[["id"]])), ",")), .before = 1) %>%
+    mutate(outcome = outcome)
+}
+
+bind_rows(
+  map(c("drink_bool_b", "tob_bool_b", "mj_bool_b", "alc_any_curious", "tob_any_curious", "mj_any_curious", "alc_try_soon", "tob_try_soon", "mj_try_soon"), resultsGen, modType = "main", dimVar = "dim_y_ss_mean") %>%
+    bind_rows() %>%
+    pivot_wider(names_from = outcome, values_from = pe_ci),
+  
+  map(c("drink_bool_b", "tob_bool_b", "mj_bool_b", "alc_any_curious", "tob_any_curious", "mj_any_curious", "alc_try_soon", "tob_try_soon", "mj_try_soon"), resultsGen, modType = "int", dimVar = "dim_y_ss_mean") %>%
+    bind_rows() %>%
+    pivot_wider(names_from = outcome, values_from = pe_ci)) %>%
+  slice(-c(8, 9)) %>%
+  add_row(effect = "as.factor(race_ethnicity)Non-Hispanic White only", .before = 3) %>%
+  mutate(effect = gsub("as.factor\\(race_ethnicity\\)", "", effect),
+         effect = gsub("\\:dim_y_ss_mean", " x Discrimination", effect),
+         effect = gsub("dim_y_ss_mean", "Discrimination score", effect),
+         effect = ifelse(effect %in% c("n", "obs."), "", effect),
+         across(everything(), ~ ifelse(is.na(.x), "Ref.", .x))) %>%
+  kable(align = "lrrrrrrrrr",
+        caption = "Table 3: Adjusted Odds Ratios for Substance Use and Intentions to Use as Functions of Race / Ethnicity and Discrimination (Time-Invariant): aOR (95% CI)",
+        col.names = c("", rep(c("Alcohol", "Tobacco", "Marijuana"), 3))) %>%
+  kable_classic_2("striped") %>%
+  column_spec(c(1, 4, 7), border_right = TRUE) %>%
+  pack_rows("Main Effects Only: Models 1-9", 3, 8, background = "#ffffff") %>%
+  pack_rows("Interaction Effects Only: Models 10-18", 9, 13, background = "#ffffff") %>%
+  row_spec(0:1, bold = TRUE) %>%
+  row_spec(2, bold = TRUE, extra_css = "border-bottom: 1px solid") %>%
+  row_spec(8, extra_css = "border-bottom: 1px solid") %>%
+  add_header_above(c("", "Use" = 3, "Curiosity" = 3, "'Will Try Soon'" = 3), bold = TRUE) %>%
+  footnote(general = "All models are adjusted for time, the respondent's age at baseline, the respondent's sex, parental marital status, parental education level, parental employment status, and total combined family income. All outcomes are time-varying; all covariates (except time) are time-invariant. Confidence intervals are adjusted for multiple comparisons using the Bonferroni method, with m = 15 (the number of effects in each group of models, e.g., the 'curiosity to use' group of main effect models).",
+           general_title = "")
+
+cat("<br><br><br><br><br>")
+```
+
+## Supplemental Table 1
+
+```{r table_S1, echo = FALSE, message = FALSE, warning = FALSE, results = "asis"}
+map(c("drink_bool_b", "tob_bool_b", "mj_bool_b", "alc_any_curious", "tob_any_curious", "mj_any_curious", "alc_try_soon", "tob_try_soon", "mj_try_soon"),
+    function(x) {
+      dat %>%
+        group_by(event) %>%
+        summarize(n_0 = paste0(prettyNum(sum(!!sym(x) == 0, na.rm = TRUE), ","), " (", sprintf("%.2f", mean(!!sym(x) == 0, na.rm = TRUE) * 100), ")"),
+                  n_1 = paste0(prettyNum(sum(!!sym(x) == 1, na.rm = TRUE), ","), " (", sprintf("%.2f", mean(!!sym(x) == 1, na.rm = TRUE) * 100), ")"),
+                  n_m = paste0(prettyNum(sum(is.na(!!sym(x))),             ","), " (", sprintf("%.2f", mean(is.na(!!sym(x))) * 100),             ")")) %>%
+        mutate(variable = x)}) %>%
+  bind_rows() %>%
+  mutate(outcome = case_when(grepl("bool", variable) ~ "SubstanceUse",
+                             grepl("curious", variable) ~ "Curiosity",
+                             grepl("try", variable) ~ "WillTrySoon"),
+         
+         category = case_when(grepl("drink|alc", variable) ~ "Alcohol",
+                              grepl("tob", variable) ~ "Tobacco",
+                              grepl("mj", variable) ~ "Cannabis")) %>%
+  select(-variable) %>%
+  pivot_wider(names_from = outcome, values_from = c(n_0, n_1, n_m), names_vary = "slowest") %>%
+  mutate(event = c("Baseline", "Follow-up 1", "Follow-up 2", "Follow-up 3", "Follow-up 4")[event+1],
+         category = ifelse(row_number() %% 5 == 1, category, "")) %>%
+  select(category, event, n_0_SubstanceUse, n_1_SubstanceUse, n_m_SubstanceUse, n_0_Curiosity, n_1_Curiosity, n_m_Curiosity, n_0_WillTrySoon, n_1_WillTrySoon, n_m_WillTrySoon) %>%
+  kable(align = "llrrrrrrrrr",
+        caption = "Supplemental Table 1: Substance Use and Intentions to Use by Wave: n (%)",
+        col.names = c("", "", rep(c("No", "Yes", "Missing"), 3))) %>%
+  kable_classic_2("striped") %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(c(2, 5, 8), border_right = TRUE) %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(c(5, 10), extra_css = "border-bottom: 1px solid") %>%
+  add_header_above(c("", "", "Substance Use" = 3, "Curiosity" = 3, "Will Try Soon" = 3), bold = TRUE)
+
+cat("<br><br><br><br><br>")
+```
+
+## Supplemental Table 2
+
+```{r table_S2, echo = FALSE, message = FALSE, warning = FALSE, results = "asis"}
+dat %>%
+  group_by(event) %>%
+  summarize(dim0    = paste0(prettyNum(sum(dim_y_ss_mean_tv_c == "x = 0", na.rm = TRUE), ","),        " (", sprintf("%.2f", mean(dim_y_ss_mean_tv_c == "x = 0", na.rm = TRUE) * 100),        ")"),
+            dim0_05 = paste0(prettyNum(sum(dim_y_ss_mean_tv_c == "0 < x <= 0.5", na.rm = TRUE), ","), " (", sprintf("%.2f", mean(dim_y_ss_mean_tv_c == "0 < x <= 0.5", na.rm = TRUE) * 100), ")"),
+            dim05   = paste0(prettyNum(sum(dim_y_ss_mean_tv_c == "x > 0.5", na.rm = TRUE), ","),      " (", sprintf("%.2f", mean(dim_y_ss_mean_tv_c == "x > 0.5", na.rm = TRUE) * 100),      ")"),
+            dimM    = paste0(prettyNum(sum(is.na(dim_y_ss_mean_tv_c)), ","),                          " (", sprintf("%.2f", mean(is.na(dim_y_ss_mean_tv_c)) * 100),                          ")")) %>%
+  mutate(event = c("Baseline", "Follow-up 1", "Follow-up 2", "Follow-up 3", "Follow-up 4")[event+1],
+         across(-c(event, dimM), ~ ifelse(event %in% c("Baseline", "Follow-up 3"), "", .x))) %>%
+  select(event, dim0, dim0_05, dim05, dimM) %>%
+  kable(align = "lrrrr",
+        caption = "Supplemental Table 2: Discrimination Score by Wave: n (%)",
+        col.names = c("Event", "x = 0", "0 < x <= 0.5", "x > 0.5", "Missing")) %>%
+  kable_classic_2("striped") %>%
+  column_spec(1, border_right = TRUE) %>%
+  row_spec(0, bold = TRUE) %>%
+  add_header_above(c("", "Discrimination Score" = 4), bold = TRUE)
+
+cat("<br><br><br><br><br>")
+```
+
+## Supplemental Table 3
+
+```{r table_S3, echo = FALSE, message = FALSE, warning = FALSE, results = "asis"}
+map(c("demo_prnt_prtnr_ed_agg", "demo_prnt_marital_v2", "demo_prnt_prtnr_empl", "demo_comb_income_agg"),
+    function(.x) {
+      bind_rows(
+        dat %>%
+          filter(!is.na(!!sym(.x))) %>%
+          group_by(event) %>%
+          count(!!sym(.x)) %>%
+          mutate(n = paste0(n, " (", sprintf("%.2f", n / sum(n) * 100), ")")),
+        
+        dat %>%
+          group_by(event) %>%
+          summarize(n = paste0(sum(is.na(!!sym(.x))), " (", sprintf("%.2f", mean(is.na(!!sym(.x))) * 100), ")"),
+                    !!sym(.x) := "Missing")) %>%
+        mutate(event = c("Baseline", "Follow-up 1", "Follow-up 2", "Follow-up 3", "Follow-up 4")[event+1]) %>%
+        pivot_wider(names_from = event, values_from = n) %>%
+        rename(value = !!sym(.x)) %>%
+        mutate(outcome = .x) }) %>%
+  bind_rows() %>%
+  mutate(outcome = case_when(value == "Less than high school" ~ "Highest level of parental education",
+                             value == "Not married" ~ "Parental marital status",
+                             value == "Neither parent or partner works full-time" ~ "Parental employment status",
+                             value == "$24,999 or lower" ~ "Total combined family income")) %>%
+  select(outcome, value, Baseline, `Follow-up 1`, `Follow-up 2`, `Follow-up 3`, `Follow-up 4`) %>%
+  kable(align = "llrrrrr",
+        caption = "Supplemental Table 3: Demographics by Wave: n (%)",
+        col.names = c("", "", "Baseline", "Follow-up 1", "Follow-up 2", "Follow-up 3", "Follow-up 4")) %>%
+  kable_classic_2("striped") %>%
+  column_spec(1, border_right = TRUE, bold = TRUE) %>%
+  column_spec(2, border_right = TRUE) %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(c(6, 9, 12), extra_css = "border-bottom: 1px solid")
+
+cat("<br><br><br><br><br>")
+```
+
+## Supplemental Table 4
+
+```{r table_S4, echo = FALSE, message = FALSE, warning = FALSE, results = "asis"}
+bind_rows(
+  map(c("drink_bool_b", "tob_bool_b", "mj_bool_b", "alc_any_curious", "tob_any_curious", "mj_any_curious", "alc_try_soon", "tob_try_soon", "mj_try_soon"), resultsGen, modType = "main", dimVar = "dim_y_ss_mean_tv") %>%
+    bind_rows() %>%
+    pivot_wider(names_from = outcome, values_from = pe_ci),
+  
+  map(c("drink_bool_b", "tob_bool_b", "mj_bool_b", "alc_any_curious", "tob_any_curious", "mj_any_curious", "alc_try_soon", "tob_try_soon", "mj_try_soon"), resultsGen, modType = "int", dimVar = "dim_y_ss_mean_tv") %>%
+    bind_rows() %>%
+    pivot_wider(names_from = outcome, values_from = pe_ci)) %>%
+  slice(-c(8, 9)) %>%
+  add_row(effect = "as.factor(race_ethnicity)Non-Hispanic White only", .before = 3) %>%
+  mutate(effect = gsub("as.factor\\(race_ethnicity\\)", "", effect),
+         effect = gsub("\\:dim_y_ss_mean_tv", " x Discrimination", effect),
+         effect = gsub("dim_y_ss_mean_tv", "Discrimination score", effect),
+         effect = ifelse(effect %in% c("n", "obs."), "", effect),
+         across(everything(), ~ ifelse(is.na(.x), "Ref.", .x))) %>%
+  kable(align = "lrrrrrrrrr",
+        caption = "Supplemental Table 4: Adjusted Odds Ratios for Substance Use and Intentions to Use as Functions of Race / Ethnicity and Discrimination (Time-Varying): aOR (95% CI)",
+        col.names = c("", rep(c("Alcohol", "Tobacco", "Marijuana"), 3))) %>%
+  kable_classic_2("striped") %>%
+  column_spec(c(1, 4, 7), border_right = TRUE) %>%
+  pack_rows("Main Effects Only: Models 1-9", 3, 8, background = "#ffffff") %>%
+  pack_rows("Interaction Effects Only: Models 10-18", 9, 13, background = "#ffffff") %>%
+  row_spec(0:1, bold = TRUE) %>%
+  row_spec(2, bold = TRUE, extra_css = "border-bottom: 1px solid") %>%
+  row_spec(8, extra_css = "border-bottom: 1px solid") %>%
+  add_header_above(c("", "Use" = 3, "Curiosity" = 3, "'Will Try Soon'" = 3), bold = TRUE) %>%
+  footnote(general = "All models are adjusted for time, the respondent's age at baseline, the respondent's sex, parental marital status, parental education level, parental employment status, and total combined family income. All outcomes are time-varying; all covariates (except time and the discrimination measure) are time-invariant. Confidence intervals are adjusted for multiple comparisons using the Bonferroni method, with m = 15 (the number of effects in each group of models, e.g., the 'curiosity to use' group of main effect models).",
+           general_title = "")
+
+cat("<br><br><br><br><br>")
+```
+
+## Supplemental Table 5
+
+```{r table_S5, echo = FALSE, message = FALSE, warning = FALSE, results = "asis"}
+map(c("drink_bool_b", "tob_bool_b", "mj_bool_b", "alc_any_curious", "tob_any_curious", "mj_any_curious", "alc_try_soon", "tob_try_soon", "mj_try_soon"), resultsGen, modType = "full", dimVar = "dim_y_ss_mean") %>%
+  bind_rows() %>%
+  pivot_wider(names_from = outcome, values_from = pe_ci) %>%
+  add_row(effect = "as.factor(race_ethnicity)Non-Hispanic White only", .before = 3) %>%
+  mutate(effect = gsub("as.factor\\(race_ethnicity\\)", "", effect),
+         effect = gsub("\\:dim_y_ss_mean", " x Discrimination", effect),
+         effect = gsub("dim_y_ss_mean", "Discrimination score", effect),
+         effect = ifelse(effect %in% c("n", "obs."), "", effect),
+         across(everything(), ~ ifelse(is.na(.x), "Ref.", .x))) %>%
+  kable(align = "lrrrrrrrrr",
+        caption = "Supplemental Table 5: Adjusted Odds Ratios for Substance Use and Intentions to Use as Functions of Race / Ethnicity x Discrimination (Time-Invariant): aOR (95% CI)",
+        col.names = c("", rep(c("Alcohol", "Tobacco", "Marijuana"), 3))) %>%
+  kable_classic_2("striped") %>%
+  column_spec(c(1, 4, 7), border_right = TRUE) %>%
+  pack_rows("Full Models - Main Effects and Interaction Effects: Models 1-9", 3, 12, background = "#ffffff") %>%
+  row_spec(0:1, bold = TRUE) %>%
+  row_spec(2, bold = TRUE, extra_css = "border-bottom: 1px solid") %>%
+  add_header_above(c("", "Use" = 3, "Curiosity" = 3, "'Will Try Soon'" = 3), bold = TRUE) %>%
+  footnote(general = "All models are adjusted for time, the respondent's age at baseline, the respondent's sex, parental marital status, parental education level, parental employment status, and total combined family income. All outcomes are time-varying; all covariates (except time) are time-invariant. Confidence intervals are adjusted for multiple comparisons using the Bonferroni method, with m = 27 (the number of effects in each group of models, e.g., the 'curiosity to use' group of models).",
+           general_title = "")
+
+cat("<br><br><br><br><br>")
+```
+
+## Supplemental Table 6
+
+```{r table_S6, echo = FALSE, message = FALSE, warning = FALSE, results = "asis"}
+map(c("drink_bool_b", "tob_bool_b", "mj_bool_b", "alc_any_curious", "tob_any_curious", "mj_any_curious", "alc_try_soon", "tob_try_soon", "mj_try_soon"), resultsGen, modType = "full", dimVar = "dim_y_ss_mean_tv") %>%
+  bind_rows() %>%
+  pivot_wider(names_from = outcome, values_from = pe_ci) %>%
+  add_row(effect = "as.factor(race_ethnicity)Non-Hispanic White only", .before = 3) %>%
+  mutate(effect = gsub("as.factor\\(race_ethnicity\\)", "", effect),
+         effect = gsub("\\:dim_y_ss_mean_tv", " x Discrimination", effect),
+         effect = gsub("dim_y_ss_mean_tv", "Discrimination score", effect),
+         effect = ifelse(effect %in% c("n", "obs."), "", effect),
+         across(everything(), ~ ifelse(is.na(.x), "Ref.", .x))) %>%
+  kable(align = "lrrrrrrrrr",
+        caption = "Supplemental Table 6: Adjusted Odds Ratios for Substance Use and Intentions to Use as Functions of Race / Ethnicity x Discrimination (Time-Varying): aOR (95% CI)",
+        col.names = c("", rep(c("Alcohol", "Tobacco", "Marijuana"), 3))) %>%
+  kable_classic_2("striped") %>%
+  column_spec(c(1, 4, 7), border_right = TRUE) %>%
+  pack_rows("Full Models - Main Effects and Interaction Effects: Models 1-9", 3, 12, background = "#ffffff") %>%
+  row_spec(0:1, bold = TRUE) %>%
+  row_spec(2, bold = TRUE, extra_css = "border-bottom: 1px solid") %>%
+  add_header_above(c("", "Use" = 3, "Curiosity" = 3, "'Will Try Soon'" = 3), bold = TRUE) %>%
+  footnote(general = "All models are adjusted for time, the respondent's age at baseline, the respondent's sex, parental marital status, parental education level, parental employment status, and total combined family income. All outcomes are time-varying; all covariates (except time and the discrimination measure) are time-invariant. Confidence intervals are adjusted for multiple comparisons using the Bonferroni method, with m = 27 (the number of effects in each group of models, e.g., the 'curiosity to use' group of models).",
+           general_title = "")
+```

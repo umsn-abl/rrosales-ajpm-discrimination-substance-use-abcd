@@ -2,7 +2,7 @@
 
 ## description
 
-This code uses ABCD Release 5.1 data to assess the association between ethnic discrimination and substance use and susceptibility to use. Descriptive statistics (prevalence) and adjusted odds ratios (binary logistic regression models) are used to quantify this association.  
+This code uses ABCD Release 5.1 data to assess the association between ethnic discrimination and substance use and susceptibility to use. Descriptive statistics (prevalence) and binary logistic regression models (adjusted odds ratios) are used to quantify this association.  
 
 ## files
 
